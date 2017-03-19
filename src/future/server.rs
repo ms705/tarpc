@@ -50,11 +50,11 @@ impl Handle {
               Resp: Serialize + 'static,
               E: Serialize + 'static
     {
-        let (addr, shutdown, server) =
-            listen_with(new_service,
-                        addr, handle,
-                        options.max_payload_size,
-                        Acceptor::from(options))?;
+        let (addr, shutdown, server) = listen_with(new_service,
+                                                   addr,
+                                                   handle,
+                                                   options.max_payload_size,
+                                                   Acceptor::from(options))?;
         Ok((Handle {
                 addr: addr,
                 shutdown: shutdown,
@@ -95,8 +95,8 @@ impl Acceptor {
         match *self {
             Acceptor::Tls(ref tls_acceptor) => {
                 futures::Either::A(tls_acceptor.accept_async(socket)
-                    .map(StreamType::Tls as _)
-                    .map_err(native_to_io))
+                                       .map(StreamType::Tls as _)
+                                       .map_err(native_to_io))
             }
             Acceptor::Tcp => futures::Either::B(futures::ok(StreamType::Tcp(socket))),
         }
@@ -158,9 +158,7 @@ pub struct Options {
 impl Default for Options {
     #[cfg(not(feature = "tls"))]
     fn default() -> Self {
-        Options {
-            max_payload_size: 2 << 20,
-        }
+        Options { max_payload_size: 2 << 20 }
     }
 
     #[cfg(feature = "tls")]
@@ -291,9 +289,9 @@ impl<S: NewService> NewService for ConnectionTrackingNewService<S> {
     fn new_service(&self) -> io::Result<Self::Instance> {
         self.connection_tracker.increment();
         Ok(ConnectionTrackingService {
-            service: self.new_service.new_service()?,
-            tracker: self.connection_tracker.clone(),
-        })
+               service: self.new_service.new_service()?,
+               tracker: self.connection_tracker.clone(),
+           })
     }
 }
 
@@ -471,9 +469,9 @@ fn shutdown_watcher() -> (ConnectionTracker, Shutdown, ShutdownWatcher) {
         .map(ShutdownSetter { shutdown: shutdown })
         .merge(connection_rx.map(ConnectionWatcher { connections: connections }))
         .take_while(ShutdownPredicate {
-            shutdown: shutdown2,
-            connections: connections2,
-        })
+                        shutdown: shutdown2,
+                        connections: connections2,
+                    })
         .map_err(Warn("UnboundedReceiver resolved to an Err; can it do that?"))
         .for_each(AlwaysOk);
 
@@ -544,13 +542,13 @@ fn listen_with<S, Req, Resp, E>(new_service: S,
     let server = listener.incoming()
         .and_then(acceptor)
         .for_each(Bind {
-            max_payload_size: max_payload_size,
-            handle: handle,
-            new_service: ConnectionTrackingNewService {
-                connection_tracker: connection_tracker,
-                new_service: new_service,
-            },
-        })
+                      max_payload_size: max_payload_size,
+                      handle: handle,
+                      new_service: ConnectionTrackingNewService {
+                          connection_tracker: connection_tracker,
+                          new_service: new_service,
+                      },
+                  })
         .map_err(log_err as _);
 
     let server = server.select(shutdown_future).then(AlwaysOk);
@@ -561,10 +559,14 @@ fn log_err(e: io::Error) {
     error!("While processing incoming connections: {}", e);
 }
 
-struct Bind<S> {
+/// xxx
+pub struct Bind<S> {
+    /// xxx
     max_payload_size: u64,
-    handle: reactor::Handle,
-    new_service: S,
+    /// xxx
+    pub handle: reactor::Handle,
+    /// xxx
+    pub new_service: S,
 }
 
 impl<S, Req, Resp, E> Bind<S>
@@ -575,11 +577,13 @@ impl<S, Req, Resp, E> Bind<S>
           Resp: Serialize + 'static,
           E: Serialize + 'static
 {
-    fn bind<I>(&self, socket: I) -> io::Result<()>
+    /// xxx
+    pub fn bind<I>(&self, socket: I) -> io::Result<()>
         where I: Io + 'static
     {
-        Proto::new(self.max_payload_size)
-            .bind_server(&self.handle, socket, self.new_service.new_service()?);
+        Proto::new(self.max_payload_size).bind_server(&self.handle,
+                                                      socket,
+                                                      self.new_service.new_service()?);
         Ok(())
     }
 }
