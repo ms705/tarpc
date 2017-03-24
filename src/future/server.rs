@@ -562,7 +562,7 @@ fn log_err(e: io::Error) {
 /// xxx
 pub struct Bind<S> {
     /// xxx
-    max_payload_size: u64,
+    pub max_payload_size: u64,
     /// xxx
     pub handle: reactor::Handle,
     /// xxx
