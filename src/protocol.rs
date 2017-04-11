@@ -16,7 +16,7 @@ use tokio_io::codec::{Encoder, Decoder, Framed};
 use tokio_proto::multiplex::{ClientProto, ServerProto};
 use tokio_proto::streaming::multiplex::RequestId;
 
-// `Encode` is the type that `Codec` encodes. `Decode` is the type it decodes.
+/// `Encode` is the type that `Codec` encodes. `Decode` is the type it decodes.
 #[derive(Debug)]
 pub struct Codec<Encode, Decode> {
     max_payload_size: u64,
