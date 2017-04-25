@@ -3,22 +3,28 @@
 // Licensed under the MIT License, <LICENSE or http://opensource.org/licenses/MIT>.
 // This file may not be copied, modified, or distributed except according to those terms.
 
-use {serde, tokio_core};
+use serde;
 use bincode::{self, Infinite};
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{BigEndian, ReadBytesExt};
+use bytes::BytesMut;
+use bytes::buf::BufMut;
 use std::io::{self, Cursor};
 use std::marker::PhantomData;
 use std::mem;
-use tokio_core::io::{EasyBuf, Framed, Io};
+use tokio_io::{AsyncRead, AsyncWrite};
+use tokio_io::codec::{Encoder, Decoder, Framed};
 use tokio_proto::multiplex::{ClientProto, ServerProto};
 use tokio_proto::streaming::multiplex::RequestId;
 
 // `Encode` is the type that `Codec` encodes. `Decode` is the type it decodes.
+#[derive(Debug)]
 pub struct Codec<Encode, Decode> {
+    max_payload_size: u64,
     state: CodecState,
     _phantom_data: PhantomData<(Encode, Decode)>,
 }
 
+#[derive(Debug)]
 enum CodecState {
     Id,
     Len { id: u64 },
@@ -26,36 +32,58 @@ enum CodecState {
 }
 
 impl<Encode, Decode> Codec<Encode, Decode> {
-    fn new() -> Self {
+    fn new(max_payload_size: u64) -> Self {
         Codec {
+            max_payload_size: max_payload_size,
             state: CodecState::Id,
             _phantom_data: PhantomData,
         }
     }
 }
 
-impl<Encode, Decode> tokio_core::io::Codec for Codec<Encode, Decode>
+fn too_big(payload_size: u64, max_payload_size: u64) -> io::Error {
+    warn!("Not sending too-big packet of size {} (max is {})",
+          payload_size,
+          max_payload_size);
+    io::Error::new(io::ErrorKind::InvalidData,
+                   format!("Maximum payload size is {} bytes but got a payload of {}",
+                           max_payload_size,
+                           payload_size))
+}
+
+impl<Encode, Decode> Encoder for Codec<Encode, Decode>
     where Encode: serde::Serialize,
           Decode: serde::Deserialize
 {
-    type Out = (RequestId, Encode);
-    type In = (RequestId, Result<Decode, bincode::Error>);
+    type Item = (RequestId, Encode);
+    type Error = io::Error;
 
-    fn encode(&mut self, (id, message): Self::Out, buf: &mut Vec<u8>) -> io::Result<()> {
-        buf.write_u64::<BigEndian>(id).unwrap();
+    fn encode(&mut self, (id, message): Self::Item, buf: &mut BytesMut) -> io::Result<()> {
+        let payload_size = bincode::serialized_size(&message);
+        if payload_size > self.max_payload_size {
+            return Err(too_big(payload_size, self.max_payload_size));
+        }
+        let message_size = 2 * mem::size_of::<u64>() + payload_size as usize;
+        buf.reserve(message_size);
+        buf.put_u64::<BigEndian>(id);
         trace!("Encoded request id = {} as {:?}", id, buf);
-        buf.write_u64::<BigEndian>(bincode::serialized_size(&message)).unwrap();
-        bincode::serialize_into(buf,
-                                &message,
-                                Infinite)
+        buf.put_u64::<BigEndian>(payload_size);
+        bincode::serialize_into(&mut buf.writer(), &message, Infinite)
             .map_err(|serialize_err| io::Error::new(io::ErrorKind::Other, serialize_err))?;
         trace!("Encoded buffer: {:?}", buf);
         Ok(())
     }
+}
 
-    fn decode(&mut self, buf: &mut EasyBuf) -> Result<Option<Self::In>, io::Error> {
+impl<Encode, Decode> Decoder for Codec<Encode, Decode>
+    where Decode: serde::Deserialize
+{
+    type Item = (RequestId, Result<Decode, bincode::Error>);
+    type Error = io::Error;
+
+    fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<Self::Item>> {
         use self::CodecState::*;
-        trace!("Codec::decode: {:?}", buf.as_slice());
+        trace!("Codec::decode: {:?}", buf);
 
         loop {
             match self.state {
@@ -64,9 +92,9 @@ impl<Encode, Decode> tokio_core::io::Codec for Codec<Encode, Decode>
                     return Ok(None);
                 }
                 Id => {
-                    let mut id_buf = buf.drain_to(mem::size_of::<u64>());
+                    let mut id_buf = buf.split_to(mem::size_of::<u64>());
                     let id = Cursor::new(&mut id_buf).read_u64::<BigEndian>()?;
-                    trace!("--> Parsed id = {} from {:?}", id, id_buf.as_slice());
+                    trace!("--> Parsed id = {} from {:?}", id, id_buf);
                     self.state = Len { id: id };
                 }
                 Len { .. } if buf.len() < mem::size_of::<u64>() => {
@@ -75,11 +103,14 @@ impl<Encode, Decode> tokio_core::io::Codec for Codec<Encode, Decode>
                     return Ok(None);
                 }
                 Len { id } => {
-                    let len_buf = buf.drain_to(mem::size_of::<u64>());
+                    let len_buf = buf.split_to(mem::size_of::<u64>());
                     let len = Cursor::new(len_buf).read_u64::<BigEndian>()?;
                     trace!("--> Parsed payload length = {}, remaining buffer length = {}",
                            len,
                            buf.len());
+                    if len > self.max_payload_size {
+                        return Err(too_big(len, self.max_payload_size));
+                    }
                     self.state = Payload { id: id, len: len };
                 }
                 Payload { len, .. } if buf.len() < len as usize => {
@@ -89,9 +120,8 @@ impl<Encode, Decode> tokio_core::io::Codec for Codec<Encode, Decode>
                     return Ok(None);
                 }
                 Payload { id, len } => {
-                    let payload = buf.drain_to(len as usize);
-                    let result = bincode::deserialize_from(&mut Cursor::new(payload),
-                                                           Infinite);
+                    let payload = buf.split_to(len as usize);
+                    let result = bincode::deserialize_from(&mut Cursor::new(payload), Infinite);
                     // Reset the state machine because, either way, we're done processing this
                     // message.
                     self.state = Id;
@@ -104,17 +134,24 @@ impl<Encode, Decode> tokio_core::io::Codec for Codec<Encode, Decode>
 }
 
 /// Implements the `multiplex::ServerProto` trait.
-pub struct Proto<Encode, Decode>(PhantomData<(Encode, Decode)>);
+#[derive(Debug)]
+pub struct Proto<Encode, Decode> {
+    max_payload_size: u64,
+    _phantom_data: PhantomData<(Encode, Decode)>,
+}
 
 impl<Encode, Decode> Proto<Encode, Decode> {
     /// Returns a new `Proto`.
-    pub fn new() -> Self {
-        Proto(PhantomData)
+    pub fn new(max_payload_size: u64) -> Self {
+        Proto {
+            max_payload_size: max_payload_size,
+            _phantom_data: PhantomData,
+        }
     }
 }
 
 impl<T, Encode, Decode> ServerProto<T> for Proto<Encode, Decode>
-    where T: Io + 'static,
+    where T: AsyncRead + AsyncWrite + 'static,
           Encode: serde::Serialize + 'static,
           Decode: serde::Deserialize + 'static
 {
@@ -124,12 +161,12 @@ impl<T, Encode, Decode> ServerProto<T> for Proto<Encode, Decode>
     type BindTransport = Result<Self::Transport, io::Error>;
 
     fn bind_transport(&self, io: T) -> Self::BindTransport {
-        Ok(io.framed(Codec::new()))
+        Ok(io.framed(Codec::new(self.max_payload_size)))
     }
 }
 
 impl<T, Encode, Decode> ClientProto<T> for Proto<Encode, Decode>
-    where T: Io + 'static,
+    where T: AsyncRead + AsyncWrite + 'static,
           Encode: serde::Serialize + 'static,
           Decode: serde::Deserialize + 'static
 {
@@ -139,33 +176,47 @@ impl<T, Encode, Decode> ClientProto<T> for Proto<Encode, Decode>
     type BindTransport = Result<Self::Transport, io::Error>;
 
     fn bind_transport(&self, io: T) -> Self::BindTransport {
-        Ok(io.framed(Codec::new()))
+        Ok(io.framed(Codec::new(self.max_payload_size)))
     }
 }
 
 #[test]
 fn serialize() {
-    use tokio_core::io::Codec as TokioCodec;
-
     const MSG: (u64, (char, char, char)) = (4, ('a', 'b', 'c'));
-    let mut buf = EasyBuf::new();
-    let mut vec = Vec::new();
+    let mut buf = BytesMut::with_capacity(10);
 
     // Serialize twice to check for idempotence.
     for _ in 0..2 {
-        let mut codec: Codec<(char, char, char), (char, char, char)> = Codec::new();
-        codec.encode(MSG, &mut vec).unwrap();
-        buf.get_mut().append(&mut vec);
-        let actual: Result<Option<(u64, Result<(char, char, char), bincode::Error>)>, io::Error> =
-            codec.decode(&mut buf);
+        let mut codec: Codec<(char, char, char), (char, char, char)> = Codec::new(2_000_000);
+        codec.encode(MSG, &mut buf).unwrap();
+        let actual: Result<Option<(u64, Result<(char, char, char), bincode::Error>)>,
+                           io::Error> = codec.decode(&mut buf);
 
         match actual {
             Ok(Some((id, ref v))) if id == MSG.0 && *v.as_ref().unwrap() == MSG.1 => {}
             bad => panic!("Expected {:?}, but got {:?}", Some(MSG), bad),
         }
 
-        assert!(buf.get_mut().is_empty(),
-                "Expected empty buf but got {:?}",
-                *buf.get_mut());
+        assert!(buf.is_empty(), "Expected empty buf but got {:?}", buf);
     }
+}
+
+#[test]
+fn deserialize_big() {
+    let mut codec: Codec<Vec<u8>, Vec<u8>> = Codec::new(24);
+
+    let mut buf = BytesMut::with_capacity(40);
+    assert_eq!(codec
+                   .encode((0, vec![0; 24]), &mut buf)
+                   .err()
+                   .unwrap()
+                   .kind(),
+               io::ErrorKind::InvalidData);
+
+    // Header
+    buf.put_slice(&mut [0u8; 8]);
+    // Len
+    buf.put_slice(&mut [0u8, 0, 0, 0, 0, 0, 0, 25]);
+    assert_eq!(codec.decode(&mut buf).err().unwrap().kind(),
+               io::ErrorKind::InvalidData);
 }

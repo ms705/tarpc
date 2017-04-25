@@ -27,21 +27,48 @@ cfg_if! {
 }
 
 /// Additional options to configure how the client connects and operates.
-#[derive(Default)]
+#[derive(Debug)]
 pub struct Options {
+    /// Max packet size in bytes.
+    max_payload_size: u64,
     reactor: Option<Reactor>,
     #[cfg(feature = "tls")]
     tls_ctx: Option<Context>,
 }
 
+impl Default for Options {
+    #[cfg(feature = "tls")]
+    fn default() -> Self {
+        Options {
+            max_payload_size: 2 << 20,
+            reactor: None,
+            tls_ctx: None,
+        }
+    }
+
+    #[cfg(not(feature = "tls"))]
+    fn default() -> Self {
+        Options {
+            max_payload_size: 2 << 20,
+            reactor: None,
+        }
+    }
+}
+
 impl Options {
-    /// Drive using the given reactor handle. Only used by `FutureClient`s.
+    /// Set the max payload size in bytes. The default is 2 << 20 (2 MiB).
+    pub fn max_payload_size(mut self, bytes: u64) -> Self {
+        self.max_payload_size = bytes;
+        self
+    }
+
+    /// Drive using the given reactor handle.
     pub fn handle(mut self, handle: reactor::Handle) -> Self {
         self.reactor = Some(Reactor::Handle(handle));
         self
     }
 
-    /// Drive using the given reactor remote. Only used by `FutureClient`s.
+    /// Drive using the given reactor remote.
     pub fn remote(mut self, remote: reactor::Remote) -> Self {
         self.reactor = Some(Reactor::Remote(remote));
         self
@@ -60,6 +87,19 @@ enum Reactor {
     Remote(reactor::Remote),
 }
 
+impl fmt::Debug for Reactor {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        const HANDLE: &'static &'static str = &"Reactor::Handle";
+        const HANDLE_INNER: &'static &'static str = &"Handle { .. }";
+        const REMOTE: &'static &'static str = &"Reactor::Remote";
+        const REMOTE_INNER: &'static &'static str = &"Remote { .. }";
+
+        match *self {
+            Reactor::Handle(_) => f.debug_tuple(HANDLE).field(HANDLE_INNER).finish(),
+            Reactor::Remote(_) => f.debug_tuple(REMOTE).field(REMOTE_INNER).finish(),
+        }
+    }
+}
 #[doc(hidden)]
 pub struct Client<Req, Resp, E>
     where Req: Serialize + 'static,
@@ -106,12 +146,12 @@ impl<Req, Resp, E> Client<Req, Resp, E>
           Resp: Deserialize + 'static,
           E: Deserialize + 'static
 {
-    fn bind(handle: &reactor::Handle, tcp: StreamType) -> Self
+    fn bind(handle: &reactor::Handle, tcp: StreamType, max_payload_size: u64) -> Self
         where Req: Serialize + Sync + Send + 'static,
               Resp: Deserialize + Sync + Send + 'static,
               E: Deserialize + Sync + Send + 'static
     {
-        let inner = Proto::new().bind_client(&handle, tcp);
+        let inner = Proto::new(max_payload_size).bind_client(&handle, tcp);
         Client { inner }
     }
 
@@ -161,6 +201,8 @@ impl<Req, Resp, E> ClientExt for Client<Req, Resp, E>
         #[cfg(feature = "tls")]
         let tls_ctx = options.tls_ctx.take();
 
+        let max_payload_size = options.max_payload_size;
+
         let connect = move |handle: &reactor::Handle| {
             let handle2 = handle.clone();
             TcpStream::connect(&addr, handle)
@@ -180,12 +222,13 @@ impl<Req, Resp, E> ClientExt for Client<Req, Resp, E>
                     #[cfg(not(feature = "tls"))]
                     future::ok(StreamType::Tcp(socket))
                 })
-                .map(move |tcp| Client::bind(&handle2, tcp))
+                .map(move |tcp| Client::bind(&handle2, tcp, max_payload_size))
         };
         let (tx, rx) = futures::oneshot();
         let setup = move |handle: &reactor::Handle| {
             connect(handle).then(move |result| {
-                tx.complete(result);
+                // If send fails it means the client no longer cared about connecting.
+                let _ = tx.send(result);
                 Ok(())
             })
         };

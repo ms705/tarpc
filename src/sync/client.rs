@@ -1,4 +1,3 @@
-
 use future::client::{Client as FutureClient, ClientExt as FutureClientExt,
                      Options as FutureOptions};
 /// Exposes a trait for connecting synchronously to servers.
@@ -29,7 +28,10 @@ impl<Req, Resp, E> Clone for Client<Req, Resp, E> {
 
 impl<Req, Resp, E> fmt::Debug for Client<Req, Resp, E> {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(f, "Client {{ .. }}")
+        const PROXY: &'static &'static str = &"ClientProxy { .. }";
+        f.debug_struct("Client")
+            .field("proxy", PROXY)
+            .finish()
     }
 }
 
@@ -40,24 +42,64 @@ impl<Req, Resp, E> Client<Req, Resp, E>
 {
     /// Drives an RPC call for the given request.
     pub fn call(&self, request: Req) -> Result<Resp, ::Error<E>> {
+        // Must call wait here to block on the response.
+        // The request handler relies on this fact to safely unwrap the
+        // oneshot send.
         self.proxy.call(request).wait()
     }
 
 }
 
 /// Additional options to configure how the client connects and operates.
-#[derive(Default)]
 pub struct Options {
+    /// Max packet size in bytes.
+    max_payload_size: u64,
     #[cfg(feature = "tls")]
     tls_ctx: Option<Context>,
 }
 
+impl Default for Options {
+    #[cfg(not(feature = "tls"))]
+    fn default() -> Self {
+        Options {
+            max_payload_size: 2_000_000,
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    fn default() -> Self {
+        Options {
+            max_payload_size: 2_000_000,
+            tls_ctx: None,
+        }
+    }
+}
+
 impl Options {
+    /// Set the max payload size in bytes. The default is 2,000,000 (2 MB).
+    pub fn max_payload_size(mut self, bytes: u64) -> Self {
+        self.max_payload_size = bytes;
+        self
+    }
+
     /// Connect using the given `Context`
     #[cfg(feature = "tls")]
     pub fn tls(mut self, ctx: Context) -> Self {
         self.tls_ctx = Some(ctx);
         self
+    }
+}
+
+impl fmt::Debug for Options {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        #[cfg(feature = "tls")]
+        const SOME: &'static &'static str = &"Some(_)";
+        #[cfg(feature = "tls")]
+        const NONE: &'static &'static str = &"None";
+        let mut f = f.debug_struct("Options");
+        #[cfg(feature = "tls")]
+        f.field("tls_ctx", if self.tls_ctx.is_some() { SOME } else { NONE });
+        f.finish()
     }
 }
 
@@ -156,7 +198,10 @@ impl<Req, Resp, E, S> RequestHandler<Req, Resp, E, S>
             .for_each(|(request, response_tx)| {
                 let request = client.call(request)
                     .then(move |response| {
-                        response_tx.complete(response);
+                        // Safe to unwrap because clients always block on the response future.
+                        response_tx.send(response)
+                            .map_err(|_| ())
+                            .expect("Client should block on response");
                         Ok(())
                       });
                 handle.spawn(request);
